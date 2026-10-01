@@ -1,0 +1,21 @@
+name: DA3Depth
+options:
+  bundleIdPrefix: local.da3depth
+  createIntermediateGroups: true
+targets:
+  DA3Depth:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources: [DA3Depth]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.da3depth.DA3Depth
+        PRODUCT_NAME: DA3Depth
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        INFOPLIST_KEY_LSMinimumSystemVersion: "15.0"
+        SWIFT_VERSION: "5.0"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
