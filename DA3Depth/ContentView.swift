@@ -4,10 +4,21 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @ObservedObject var state: AppState
     @State private var isDropTargeted = false
+    @State private var editDeg = "0"
+    @State private var editTx = "0"
+    @State private var editTy = "0"
+    @State private var editScale = "1"
+    @State private var editDz = "0"
+    @State private var dragBaseDeg: Float?
+    @State private var dragApplyInFlight = false
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
+            if state.depth != nil {
+                Divider()
+                editBar
+            }
             Divider()
             HSplitView {
                 pane(title: "原图", cgImage: state.inputCGImage)
@@ -15,6 +26,7 @@ struct ContentView: View {
                 pane(title: "深度图（近黑远白）", cgImage: state.previewCGImage)
                     .frame(minWidth: 320)
                     .overlay { if state.processing { ProgressView("推理中…").padding().background(.regularMaterial) } }
+                    .gesture(rotationDrag)
             }
             .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted) { handleDrop($0) }
             .overlay {
@@ -80,6 +92,87 @@ struct ContentView: View {
             Text("MCP: 127.0.0.1:8378").font(.caption2).foregroundStyle(.quaternary)
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
+    }
+
+    // MARK: - 编辑 panel
+
+    private var editBar: some View {
+        HStack(spacing: 10) {
+            Text("编辑").font(.headline).foregroundStyle(.secondary)
+            editField("旋转°", $editDeg, width: 60)
+            editField("平移X", $editTx, width: 56)
+            editField("平移Y", $editTy, width: 56)
+            editField("缩放", $editScale, width: 52)
+            editField("Z偏移", $editDz, width: 60)
+            Button("应用") { applyEdits() }
+            Button("撤销") { Task { @MainActor in
+                state.status = (try? await state.editUndo()) ?? "撤销失败"
+            } }.disabled(!state.editCanUndo)
+            Button("重做") { Task { @MainActor in
+                state.status = (try? await state.editRedo()) ?? "重做失败"
+            } }.disabled(!state.editCanRedo)
+            Button("重置") { Task { @MainActor in
+                state.status = (try? await state.editReset()) ?? "重置失败"
+            } }.disabled(!state.hasEdits)
+            Spacer()
+            Text("在深度图上横向拖动可旋转").font(.caption2).foregroundStyle(.quaternary)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .onChange(of: state.editParams) { _, p in
+            editDeg = fmt(p.deg); editTx = fmt(p.tx); editTy = fmt(p.ty)
+            editScale = fmt(p.scale); editDz = fmt(p.dz)
+        }
+    }
+
+    private func editField(_ label: String, _ text: Binding<String>, width: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            TextField(label, text: text)
+                .frame(width: width)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { applyEdits() }
+        }
+    }
+
+    private func fmt(_ v: Float) -> String {
+        String(format: "%g", v)
+    }
+
+    private func parsedFields() -> (deg: Float, tx: Float, ty: Float, scale: Float, dz: Float)? {
+        guard let deg = Float(editDeg), let tx = Float(editTx), let ty = Float(editTy),
+              let scale = Float(editScale), let dz = Float(editDz), scale > 0 else { return nil }
+        return (deg, tx, ty, scale, dz)
+    }
+
+    private func applyEdits() {
+        guard let f = parsedFields() else { state.status = "编辑参数无效"; return }
+        Task { @MainActor in
+            do {
+                state.status = try await state.applyTransform(rotateDeg: f.deg, tx: f.tx, ty: f.ty,
+                                                              scale: f.scale, zShift: f.dz)
+            } catch {
+                state.status = "编辑失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private var rotationDrag: some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { v in
+                if dragBaseDeg == nil { dragBaseDeg = state.editParams.deg }
+                let deg = dragBaseDeg! + Float(v.translation.width) * 0.3
+                editDeg = fmt(deg)
+                guard !dragApplyInFlight else { return }
+                dragApplyInFlight = true
+                Task { @MainActor in
+                    _ = try? await state.applyTransform(rotateDeg: deg)
+                    dragApplyInFlight = false
+                }
+            }
+            .onEnded { _ in
+                dragBaseDeg = nil
+                applyEdits()
+            }
     }
 
     // MARK: - Actions

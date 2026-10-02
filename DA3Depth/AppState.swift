@@ -29,9 +29,20 @@ final class AppState: ObservableObject {
     @Published var status = "拖入图片开始 · CoreML computeUnits=ALL · FP16（ANE/GPU 自动调度，算子不兼容时自动回退 GPU/CPU）"
     @Published var wasPadded = false
     @Published var lastInferenceMs: Double = 0
+    /// Edit-layer params (degrees for rotation), mirrored into the 编辑 panel.
+    struct EditParams: Equatable {
+        var deg: Float = 0, tx: Float = 0, ty: Float = 0, scale: Float = 1, dz: Float = 0
+    }
+    @Published var editParams = EditParams()
+    @Published var editCanUndo = false
+    @Published var editCanRedo = false
+    @Published var hasEdits = false
 
     let engine = DepthEngine()
+    let editEngine = EditEngine()
     var lastPath: String?
+    /// Pristine inferred depth, kept for edit_reset.
+    private var rawDepth: DepthMap?
 
     var displayDepth: DepthMap? { flipped ? depth?.flippedHorizontal() : depth }
 
@@ -60,6 +71,12 @@ final class AppState: ObservableObject {
         do {
             let r = try await Task.detached { [engine] in try engine.infer(img) }.value
             depth = DepthMap(values: r.depth, width: r.width, height: r.height)
+            rawDepth = depth
+            try await editEngine.load(values: r.depth, width: r.width, height: r.height)
+            editParams = EditParams()
+            editCanUndo = false
+            editCanRedo = false
+            hasEdits = false
             wasPadded = r.wasPadded
             lastInferenceMs = r.inferenceMs
             status = String(format: "完成 · %dx%d · 推理 %.0f ms · CoreML ALL units (FP16)",
@@ -90,5 +107,80 @@ final class AppState: ObservableObject {
         guard let data else { throw DepthEngine.EngineError.badImage }
         try data.write(to: url)
         return "已导出: \(url.lastPathComponent)（\(up.width)x\(up.height)）"
+    }
+
+    // MARK: - 编辑（单一代码路径：UI 与 MCP 共用，结果逐像素一致）
+
+    private static func checksum(_ values: [Float]) -> Double {
+        values.reduce(0.0) { $0 + Double($1) }
+    }
+
+    /// Apply transform params to the edit layer (absolute values; nil keeps current).
+    /// Returns "canvas WxH checksum <v>".
+    @discardableResult
+    func applyTransform(rotateDeg: Float? = nil, tx: Float? = nil, ty: Float? = nil,
+                        scale: Float? = nil, zShift: Float? = nil) async throws -> String {
+        guard rawDepth != nil else { throw DepthEngine.EngineError.badImage }
+        let r = try await editEngine.apply(rotateDeg: rotateDeg, tx: tx, ty: ty,
+                                           scale: scale, zShift: zShift)
+        depth = DepthMap(values: r.values, width: r.width, height: r.height)
+        editCanUndo = r.canUndo
+        editCanRedo = r.canRedo
+        hasEdits = true
+        if let t = await editEngine.currentTransform() {
+            editParams = EditParams(deg: t.rotation * 180 / .pi, tx: t.tx, ty: t.ty, scale: t.scale, dz: t.zShift)
+        }
+        return String(format: "canvas %dx%d checksum %.6f", r.width, r.height,
+                      Self.checksum(r.values))
+    }
+
+    /// Bake the current canvas into a new identity base layer (flatten for cumulative edits).
+    @discardableResult
+    func fuseEdits() async throws -> String {
+        guard rawDepth != nil else { throw DepthEngine.EngineError.badImage }
+        let r = try await editEngine.bake()
+        depth = DepthMap(values: r.values, width: r.width, height: r.height)
+        editParams = EditParams()
+        editCanUndo = false
+        editCanRedo = false
+        return String(format: "已融合为基准层 · canvas %dx%d checksum %.6f",
+                      r.width, r.height, Self.checksum(r.values))
+    }
+
+    /// Clear all edits back to the raw inferred depth.
+    @discardableResult
+    func editReset() async throws -> String {
+        guard let raw = rawDepth else { throw DepthEngine.EngineError.badImage }
+        try await editEngine.load(values: raw.values, width: raw.width, height: raw.height)
+        depth = raw
+        editParams = EditParams()
+        editCanUndo = false
+        editCanRedo = false
+        hasEdits = false
+        return "已重置为原始深度（\(raw.width)x\(raw.height)）"
+    }
+
+    @discardableResult
+    func editUndo() async throws -> String {
+        guard let r = try await editEngine.undo() else { return "无可撤销操作" }
+        depth = DepthMap(values: r.values, width: depth!.width, height: depth!.height)
+        editCanUndo = r.canUndo
+        editCanRedo = r.canRedo
+        if let t = await editEngine.currentTransform() {
+            editParams = EditParams(deg: t.rotation * 180 / .pi, tx: t.tx, ty: t.ty, scale: t.scale, dz: t.zShift)
+        }
+        return "已撤销"
+    }
+
+    @discardableResult
+    func editRedo() async throws -> String {
+        guard let r = try await editEngine.redo() else { return "无可重做操作" }
+        depth = DepthMap(values: r.values, width: depth!.width, height: depth!.height)
+        editCanUndo = r.canUndo
+        editCanRedo = r.canRedo
+        if let t = await editEngine.currentTransform() {
+            editParams = EditParams(deg: t.rotation * 180 / .pi, tx: t.tx, ty: t.ty, scale: t.scale, dz: t.zShift)
+        }
+        return "已重做"
     }
 }

@@ -7,7 +7,9 @@ import Network
 /// POST /mcp  Content-Type: application/json
 /// Methods: initialize, tools/list, tools/call
 /// Tools:   load_image{path}, infer{}, set_flip{value}, set_mode{mode},
-///          export{kind: gray8|color8|gray16, path}, status{}
+///          export{kind: gray8|color8|gray16, path}, status{},
+///          transform_depth{rotate_deg?,tx?,ty?,scale?,z_shift?,layer?},
+///          fuse_depth{layers?}, edit_reset{}, edit_undo{}, edit_redo{}
 final class MCPServer: @unchecked Sendable {
     private var listener: NWListener?
     private weak var state: AppState?
@@ -95,6 +97,20 @@ final class MCPServer: @unchecked Sendable {
          "inputSchema": ["type": "object", "properties": ["kind": ["type": "string"], "path": ["type": "string"]], "required": ["kind", "path"]]],
         ["name": "status", "description": "Current state (image, depth dims, inference ms)",
          "inputSchema": ["type": "object", "properties": [:]]],
+        ["name": "transform_depth",
+         "description": "Set edit-layer transform (absolute; omitted fields keep current). rotate_deg, tx, ty (px), scale, z_shift. layer: only 0 exists in this app. Returns canvas dims + checksum.",
+         "inputSchema": ["type": "object", "properties": [
+            "rotate_deg": ["type": "number"], "tx": ["type": "number"], "ty": ["type": "number"],
+            "scale": ["type": "number"], "z_shift": ["type": "number"], "layer": ["type": "integer"]]]],
+        ["name": "fuse_depth",
+         "description": "Bake the edited canvas into a new identity base layer (flatten). layers param is accepted but ignored: this single-depth app has one editable layer.",
+         "inputSchema": ["type": "object", "properties": ["layers": ["type": "array"]]]],
+        ["name": "edit_reset", "description": "Clear all edits back to the raw inferred depth",
+         "inputSchema": ["type": "object", "properties": [:]]],
+        ["name": "edit_undo", "description": "Undo last transform edit",
+         "inputSchema": ["type": "object", "properties": [:]]],
+        ["name": "edit_redo", "description": "Redo last undone transform edit",
+         "inputSchema": ["type": "object", "properties": [:]]],
     ]
 
     private static func toolCall(params: [String: Any], state: AppState?) -> [String: Any] {
@@ -128,6 +144,33 @@ final class MCPServer: @unchecked Sendable {
             case "status":
                 let d = state.depth
                 text = "status: \(state.status) | depth=\(d.map { "\($0.width)x\($0.height)" } ?? "none") flipped=\(state.flipped) mode=\(state.mode.rawValue)"
+            case "transform_depth":
+                if let layer = args["layer"] as? Int, layer != 0 {
+                    text = "error: only layer 0 exists (single editable base layer)"
+                    break
+                }
+                func num(_ key: String) -> Float? {
+                    (args[key] as? NSNumber)?.floatValue
+                }
+                do {
+                    text = try await state.applyTransform(rotateDeg: num("rotate_deg"), tx: num("tx"),
+                                                          ty: num("ty"), scale: num("scale"),
+                                                          zShift: num("z_shift"))
+                } catch { text = "error: \(error.localizedDescription)" }
+            case "fuse_depth":
+                do {
+                    let r = try await state.fuseEdits()
+                    text = r + " · 注: layers 参数已忽略（单深度图应用只有一个可编辑层）"
+                } catch { text = "error: \(error.localizedDescription)" }
+            case "edit_reset":
+                do { text = try await state.editReset() }
+                catch { text = "error: \(error.localizedDescription)" }
+            case "edit_undo":
+                do { text = try await state.editUndo() }
+                catch { text = "error: \(error.localizedDescription)" }
+            case "edit_redo":
+                do { text = try await state.editRedo() }
+                catch { text = "error: \(error.localizedDescription)" }
             default:
                 text = "unknown tool \(name)"
             }

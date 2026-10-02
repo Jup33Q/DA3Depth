@@ -2,12 +2,18 @@ name: DA3Depth
 options:
   bundleIdPrefix: local.da3depth
   createIntermediateGroups: true
+packages:
+  DepthShaderKit:
+    path: DepthShaderKit
 targets:
   DA3Depth:
     type: application
     platform: macOS
     deploymentTarget: "15.0"
     sources: [DA3Depth, Resources]
+    dependencies:
+      - package: DepthShaderKit
+        product: DepthShaderKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.da3depth.DA3Depth

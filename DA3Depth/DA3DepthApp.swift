@@ -9,7 +9,10 @@ struct DA3DepthApp: App {
         let s = AppState()
         _state = StateObject(wrappedValue: s)
         mcp = MCPServer(state: s)
-        mcp.start()
+        // DA3DEPTH_MCP_PORT overrides the default port (used by tools/m9_mcp_chain.py
+        // to coexist with a user-running instance).
+        let port = UInt16(ProcessInfo.processInfo.environment["DA3DEPTH_MCP_PORT"] ?? "") ?? 8378
+        mcp.start(port: port)
     }
 
     var body: some Scene {
