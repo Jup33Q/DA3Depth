@@ -53,7 +53,7 @@
 - `MCPServer` 新增工具：`transform_depth{rotate,translate,scale,z_shift}`、`fuse_depth{layers}`、`edit_reset`
 - 验收：MCP 脚本完成「推理→变换→融合→导出」全链路；UI 操作与 MCP 结果逐像素一致
 
-### M7 — 2.5D 面外重投影 ✅（2026-10-03 验收）
+### M7 — 2.5D 面外重投影 ✅（2026-10-03 验收；M7-fix 同日复验）
 - [x] 面外旋转/视差位移：深度反投影 → point sprite splatting（渲染管线 depth32Float 附件走硬件 z-test，无原子操作）。坐标约定：X 横轴（右）、Y 竖轴（上）、Z 朝屏幕外（相机沿 -Z 看，深度 d → Z=-d）；绕 pivot 深度面 yaw（竖轴）+ 可选 pitch（横轴）；正 yaw 内容左移
 - [x] 同一 splat pass 输出变形彩图（rgba16Float）+ 变形深度 + 有效区 mask，共享 z-test 配对；源深度最近邻上采样到画布分辨率（禁双线性），彩图全分辨率采样
 - [x] 小洞邻域扩散填补（8 邻域均值，`fillRadius` 轮）；大洞不处理，mask=0 标出（LDI/inpainting 另立项）
@@ -61,6 +61,19 @@
 - [x] MCP `reproject_view{yaw_deg, pitch_deg?, fill_holes?, soften_edges?}`；export 新增 `warped_color|warped_depth16|warped_mask`（depth16 按 mask 有效区归一化）
 - [x] CPU parity：`Tests/.../ReprojectTests.swift` + `depthshader-parity` 双份参考，逐像素对齐（splat 边界 ±1px 容差）；`tools/m10_reproject_chain.py` 一键验收
 - 验收记录：swift test 29 项全绿；m7_shader_parity 18/18 PASS（yaw5 depth max diff 4.8e-7）；m8 bench 4K 单次重投影 GPU 5.2ms（wall 25ms，与其他 kernel 同属毫秒级）；m10 全 PASS——首尾帧各 ±5° 导出 1152×1536 变形彩图/gray16 深度/mask 至 `~/Desktop/videos/01/_reset/reproject-m10/`，覆盖率 84.7–89.1%（入画边缘带为大洞正确留空），重复链路字节级一致；yaw12→3 微步、yaw45→clamp 30°；m9 链路回归 PASS
+
+#### M7-fix — reproject_view 质量修复 ✅（2026-10-03 复验，splats 雪花 + 去遮挡填补 + warped_depth16）
+
+修复前缺陷（868b43b）：1px splat 盖不住深度梯度摊开的间距 → 主体内部雪花黑洞（与角度无关）；fill 只补小洞，大洞彩图直出纯黑、深度直出 0；warped_depth16 按 mask 有效区归一化，与 gray16 基准不一致。
+
+修复内容（全部保持纪律：无原子操作、RGB/深度同权重共享遮挡序、编辑非破坏、CPU parity 双份同步）：
+- splat 改两 pass 高斯圆盘（visibility splatting）：pass A 硬件 z-test 记每像素最近深度；pass B 同一组 splat 以高斯圆盘权重做 additive 累加（API 顺序混合，逐顶点序可复现），权重 × 对 pass A 深度的软门控（σ=depthBreak/3，>depthBreak 硬切——前景不会洇进背景）；pass C 归一化出 color/depth/mask。splat 足迹自适应：`ps = clamp(ceil(hypot(distR, distD)), 1, 8)`（右/下邻居投影间距，断层处不增长——那是真去遮挡，归填补管）。
+- 去遮挡填补升级：扩散小洞（mask 升 1）→ pull-push 金字塔（pull：颜色加权均值、深度取最远 max；push：断层门控 bilinear，只取最远层 tap 重归一化）→ 填补带用深度梯度（一阶 normal 信息）做 5×5 门控平面拟合外推（Cramer 解 + 邻域范围钳制，退化回门控均值；颜色保持门控 3×3 高斯）。彩图/深度任何情况下无纯黑/零值，mask=0 标出填补区。
+- 微步收紧到 ≤1°：链式每步只重掷 mask=1 真实内容（上一步 mask 传入 vertex 做剔除），小去遮挡逐步被扩散吸收。实验记录：1° 干净且 mask 语义保持（±5° 覆盖率 ~96-97%）；0.2°（25 步）出横向拖影梯田且覆盖率 100%（出画区被错误标为有效），弃用。中间步跳过 pull-push/平面填补（mask=0 不参与下一步 splat，结果逐位一致），省 ~20% wall。
+- warped_depth16：归一化基准改为源深度 min/max（与 gray16 导出同源），reproject_view 返回文本注明基准；全图无 0 值洞。
+- 中间发现：accumColor 不能用 rgba16Float——混合按附件精度累加，alpha 权重半精度漂移会偏置归一化深度（+1.4e-3），保持 rgba32Float。
+
+验收记录：swift test 29 全绿（含新增 pull-push/无黑洞用例）；m7 parity 20/20（新增 carved-hole 填补 depth/mask parity，diff ≤2.4e-7）；m10 全 PASS（yaw5→5 微步、yaw12→12、yaw45→clamp30/30 步，重复链路字节级一致）；m9 回归 PASS。首帧 1152×1536 覆盖率 +5° 97.0% / −5° 96.3% / +2.5° 98.4%（修复前 88.8/89.1/95.4）；尾帧 96.5/95.5（修复前 84.7–88 区间）；四组导出数值门：彩图纯黑 0 像素、mask=1 区黑洞 0、depth16 零值 0。性能：4K 5°（5 微步）wall 82ms / 单微步 GPU ~14ms（修复前单步 wall 25ms / GPU 5.2ms——双 pass 高斯 splat 单步更贵，微步加密 ×5；质量导向，可接受）；MCP 端 1152×1536 ±5° 约 550–600ms（Debug 构建，含 CPU 回读/转换）。样图：`~/Desktop/videos/01/_reset/reproject-m7fix/`（另留 step1/step0.2/planar 实验对比目录）。
 
 ## 工程约定
 

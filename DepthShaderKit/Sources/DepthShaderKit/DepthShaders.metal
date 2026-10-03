@@ -233,11 +233,37 @@ kernel void guided_smooth(texture2d<float, access::read> depthIn [[texture(0)]],
 // forbidden), back-projects to (X, Y, Z), rotates the point by yaw about the vertical
 // (Y) axis through (0, 0, -pivotZ) and then by pitch about the horizontal (X) axis
 // through the same pivot, and projects back. Positive yaw moves image content
-// leftward (viewpoint orbits rightward around the pivot). The splat lands on pixel
-// floor(u' + 0.5) — the CPU reference must use the same rounding.
+// leftward (viewpoint orbits rightward around the pivot). The disc footprint is
+// centered at (u', v'): pixel q is covered iff |q - u'| <= ps/2 (euclidean) — the
+// CPU reference must use the same rule.
 //
-// Occlusion uses the render pipeline's depth attachment (compare less, clear 1.0):
-// nearer (smaller depth) wins — hardware z-test, no atomics.
+// Occlusion discipline (two-pass visibility splatting, no atomics):
+//  pass A (visibility): opaque point sprites against a depth attachment (compare
+//    less, clear 1.0) record the NEAREST depth per pixel — the hardware z-test
+//    establishes the occlusion order.
+//  pass B (accumulate): the same splats are drawn again with additive blending and
+//    no depth test; each fragment's weight is a gaussian over the disc footprint
+//    ("diffusion" round soft splat) times an occlusion gate against the pass-A
+//    depth — contributors farther than `depthBreak` behind the visible surface are
+//    cut off, so RGB and depth share the same occlusion order and foreground can
+//    never bleed into the background.
+//  pass C (normalize): weighted sums -> color/depth/mask (mask = weight > eps).
+//
+// Splat footprint is adaptive: each sprite grows (up to `splatMax` px) to cover the
+// projected distance to its right/down neighbors (hypot of both axes, so the disc
+// also covers the parallelogram center), so depth-gradient spreading and
+// source->canvas magnification cannot leave single-pixel holes. Growth stops across
+// depth discontinuities (|dn - d| > depthBreak): those gaps are true disocclusion
+// and belong to the hole filler, not the splat. Chained micro-steps pass the
+// previous step's mask (hasMask): inpainted (mask 0) pixels are culled so only real
+// content is re-splatted and every step re-fills its own holes.
+//
+// Hole filling is two-stage: small-hole diffusion (marks mask=1), then a pull-push
+// pyramid fills every remaining mask=0 pixel from coarser levels — pull: color by
+// weighted average, depth by farthest-depth (max); push: depth-layer-gated bilinear
+// for both — so foreground depth never bleeds into the background reveal. The mask
+// keeps 0 on filled pixels to mark them as inpainted; color/depth are never left
+// 0/black, and a depth-gated 3x3 smoothing melts the plateaus in the filled band.
 
 struct ReprojectParams {
     float f;        // focal length in canvas pixels
@@ -248,26 +274,22 @@ struct ReprojectParams {
     float invZMax;  // 1 / clip far depth
     uint sw, sh;    // source depth dims
     uint cw, ch;    // canvas dims
+    uint hasMask;   // chained steps: cull vertices whose input mask is 0
+    float depthBreak; // depth discontinuity threshold blocking splat growth
+    float splatMax;   // adaptive point-size cap (px)
 };
 
 struct SplatIn {
     float4 position [[position]];
     float2 uv;      // source color texcoord (normalized, pixel-center exact)
     float z;        // rotated metric depth Z'
+    float size;     // sprite size in px (copy of ps for the fragment stage)
     float ps [[point_size]];
 };
 
-vertex SplatIn reproject_vertex(uint vid [[vertex_id]],
-                                texture2d<float, access::read> depthTex [[texture(0)]],
-                                constant ReprojectParams &p [[buffer(0)]]) {
-    SplatIn o;
-    uint u = vid % p.cw;
-    uint v = vid / p.cw;
-    // nearest upsample of the (possibly lower-res) source depth
-    uint su = min(uint((float(u) + 0.5f) * float(p.sw) / float(p.cw)), p.sw - 1);
-    uint sv = min(uint((float(v) + 0.5f) * float(p.sh) / float(p.ch)), p.sh - 1);
-    float d = depthTex.read(uint2(su, sv)).r;
-
+// Projects canvas pixel (u, v) at depth d. Returns (u', v', d', 1), or w = 0 when
+// the point lands behind the camera or beyond clip far (caller must cull).
+inline float4 reprojectProject(uint u, uint v, float d, constant ReprojectParams &p) {
     // back-project: depth d -> Z = -d (Z out of screen, camera looks along -Z)
     float X = (float(u) - p.cx) * d / p.f;
     float Y = -(float(v) - p.cy) * d / p.f;
@@ -277,43 +299,142 @@ vertex SplatIn reproject_vertex(uint vid [[vertex_id]],
     float Z1 = -X * p.syw + Zc * p.cyw;
     float Y1 = Y * p.cpt - Z1 * p.spt;    // pitch about the horizontal (X) axis
     float Z2 = Y * p.spt + Z1 * p.cpt;
-    float dp = p.pivotZ - Z2;             // back to depth: d' = -(Z' ), Z' = Z2 - pivotZ
+    float dp = p.pivotZ - Z2;             // back to depth: d' = -(Z'), Z' = Z2 - pivotZ
+    if (dp <= 1e-6f || dp * p.invZMax >= 1.0f) return float4(0.0f);
+    return float4(fma(p.f, X1 / dp, p.cx), fma(-p.f, Y1 / dp, p.cy), dp, 1.0f);
+}
 
-    float up = fma(p.f, X1 / dp, p.cx);
-    float vp = fma(-p.f, Y1 / dp, p.cy);
+vertex SplatIn reproject_vertex(uint vid [[vertex_id]],
+                                texture2d<float, access::read> depthTex [[texture(0)]],
+                                texture2d<float, access::read> maskTex [[texture(1)]],
+                                constant ReprojectParams &p [[buffer(0)]]) {
+    SplatIn o;
+    uint u = vid % p.cw;
+    uint v = vid / p.cw;
+    bool culled = false;
+    if (p.hasMask != 0 && maskTex.read(uint2(u, v)).r < 0.5f) {
+        culled = true;  // inpainted pixel from a previous micro-step: not real content
+    }
+    // nearest upsample of the (possibly lower-res) source depth
+    uint su = min(uint((float(u) + 0.5f) * float(p.sw) / float(p.cw)), p.sw - 1);
+    uint sv = min(uint((float(v) + 0.5f) * float(p.sh) / float(p.ch)), p.sh - 1);
+    float d = depthTex.read(uint2(su, sv)).r;
+    float4 pr = culled ? float4(0.0f) : reprojectProject(u, v, d, p);
 
-    float ndcX = 2.0f * (up + 0.5f) / float(p.cw) - 1.0f;
-    float ndcY = 1.0f - 2.0f * (vp + 0.5f) / float(p.ch);
-    float ndcZ = dp * p.invZMax;
-    if (dp <= 1e-6f || ndcZ >= 1.0f) {
+    if (pr.w == 0.0f) {
         // behind the camera or beyond clip far: cull the point off-screen
         o.position = float4(-2.0f, -2.0f, 2.0f, 1.0f);
         o.uv = float2(0.0f);
         o.z = 0.0f;
+        o.size = 1.0f;
         o.ps = 1.0f;
         return o;
     }
+
+    // Adaptive footprint: grow the sprite so its disc covers the projected neighbor
+    // spacing — hypot of the right/down distances also covers the parallelogram
+    // center between four splats. Growth stops across depth discontinuities (true
+    // disocclusion) and at masked-out neighbors.
+    float distR = 0.0f, distD = 0.0f;
+    if (u + 1 < p.cw) {
+        bool nValid = p.hasMask == 0 || maskTex.read(uint2(u + 1, v)).r >= 0.5f;
+        uint nsu = min(uint((float(u + 1) + 0.5f) * float(p.sw) / float(p.cw)), p.sw - 1);
+        float dn = depthTex.read(uint2(nsu, sv)).r;
+        if (nValid && abs(dn - d) <= p.depthBreak) {
+            float4 q = reprojectProject(u + 1, v, dn, p);
+            if (q.w != 0.0f) distR = length(q.xy - pr.xy);
+        }
+    }
+    if (v + 1 < p.ch) {
+        bool nValid = p.hasMask == 0 || maskTex.read(uint2(u, v + 1)).r >= 0.5f;
+        uint nsv = min(uint((float(v + 1) + 0.5f) * float(p.sh) / float(p.ch)), p.sh - 1);
+        float dn = depthTex.read(uint2(su, nsv)).r;
+        if (nValid && abs(dn - d) <= p.depthBreak) {
+            float4 q = reprojectProject(u, v + 1, dn, p);
+            if (q.w != 0.0f) distD = length(q.xy - pr.xy);
+        }
+    }
+    float ps = ceil(length(float2(distR, distD)) - 1e-3f);
+    ps = clamp(ps, 1.0f, p.splatMax);
+
+    float dp = pr.z;
+    float ndcX = 2.0f * (pr.x + 0.5f) / float(p.cw) - 1.0f;
+    float ndcY = 1.0f - 2.0f * (pr.y + 0.5f) / float(p.ch);
+    float ndcZ = dp * p.invZMax;
     o.position = float4(ndcX, ndcY, ndcZ, 1.0f);
     o.uv = float2((float(u) + 0.5f) / float(p.cw), (float(v) + 0.5f) / float(p.ch));
     o.z = dp;
-    o.ps = 1.0f;
+    o.size = ps;
+    o.ps = ps;
     return o;
 }
 
-struct SplatOut {
-    float4 color [[color(0)]];
-    float depth  [[color(1)]];
-    float mask   [[color(2)]];
+// Pass A (visibility): nearest depth per pixel via the hardware z-test; the disc
+// footprint matches the accumulate pass. Output: metric depth only.
+struct VisOut {
+    float depth [[color(0)]];
 };
 
-fragment SplatOut reproject_fragment(SplatIn in [[stage_in]],
-                                     texture2d<float, access::sample> colorTex [[texture(0)]]) {
-    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
-    SplatOut o;
-    o.color = float4(colorTex.sample(s, in.uv).rgb, 1.0f);
+fragment VisOut reproject_vis_fragment(SplatIn in [[stage_in]],
+                                       float2 pc [[point_coord]]) {
+    float2 d = (pc - 0.5f) * in.size;
+    if (dot(d, d) > 0.25f * in.size * in.size) discard_fragment();
+    VisOut o;
     o.depth = in.z;
-    o.mask = 1.0f;
     return o;
+}
+
+// Pass B (accumulate): additive-blended gaussian splats, gated against the pass-A
+// nearest depth so occluded contributors fade out (soft) / cut off (hard at
+// depthBreak). Output: rgb*weight + weight in alpha, depth*weight.
+struct AccumOut {
+    float4 color [[color(0)]];   // rgb * w, a = w
+    float depth [[color(1)]];    // z * w
+};
+
+fragment AccumOut reproject_accum_fragment(SplatIn in [[stage_in]],
+                                           texture2d<float, access::sample> colorTex [[texture(0)]],
+                                           texture2d<float, access::read> zvis [[texture(1)]],
+                                           constant ReprojectParams &p [[buffer(0)]],
+                                           float2 pc [[point_coord]]) {
+    float2 d = (pc - 0.5f) * in.size;
+    float r2 = dot(d, d);
+    float half2 = 0.25f * in.size * in.size;
+    if (r2 > half2) discard_fragment();
+    float w = exp(-4.0f * r2 / half2);   // 1 at center, ~0.018 at the rim
+    float za = zvis.read(uint2(floor(in.position.xy))).r;
+    float dz = max(in.z - za, 0.0f);     // this splat sits behind the visible surface
+    if (dz > p.depthBreak) discard_fragment();
+    float sigma = p.depthBreak / 3.0f;
+    w *= exp(-0.5f * dz * dz / (sigma * sigma));
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
+    AccumOut o;
+    o.color = float4(colorTex.sample(s, in.uv).rgb * w, w);
+    o.depth = in.z * w;
+    return o;
+}
+
+// Pass C (normalize): weighted sums -> color/depth/mask. mask = weight > eps;
+// uncovered pixels are left 0 for the hole-fill stages.
+kernel void splat_normalize(texture2d<float, access::read> accumColor [[texture(0)]],
+                            texture2d<float, access::read> accumDepth [[texture(1)]],
+                            texture2d<float, access::write> outColor [[texture(2)]],
+                            texture2d<float, access::write> outDepth [[texture(3)]],
+                            texture2d<float, access::write> outMask [[texture(4)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    uint w = outDepth.get_width();
+    uint h = outDepth.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float4 acc = accumColor.read(gid);
+    if (acc.a > 1e-3f) {
+        outColor.write(float4(acc.rgb / acc.a, 1.0f), gid);
+        outDepth.write(accumDepth.read(gid).r / acc.a, gid);
+        outMask.write(1.0f, gid);
+    } else {
+        outColor.write(float4(0.0f), gid);
+        outDepth.write(0.0f, gid);
+        outMask.write(0.0f, gid);
+    }
 }
 
 // Small-hole diffusion fill: one iteration. An invalid pixel (mask 0) with at least
@@ -413,4 +534,191 @@ kernel void edge_soften(texture2d<float, access::read> depthIn [[texture(0)]],
     }
     float3 blurred = wsum > 0.0f ? sum / wsum : c.rgb;
     colorOut.write(float4(mix(c.rgb, blurred, p.mix), c.a), gid);
+}
+
+// Pull-push pyramid hole filling (mask-0 pixels only; the mask itself is kept as-is
+// to mark inpainted regions).
+
+struct HoleSmoothParams {
+    float depthThreshold;  // depth-layer gate (source depth units)
+};
+
+// Pull (downsample): color = mask-weighted mean of the 2x2 valid children; depth =
+// MAX of the valid children — the farthest depth wins, so foreground depth can never
+// bleed into a background reveal (disocclusion shows what was behind). weight = any
+// valid child.
+kernel void pull_push_down(texture2d<float, access::read> depthIn [[texture(0)]],
+                           texture2d<float, access::read> weightIn [[texture(1)]],
+                           texture2d<float, access::read> colorIn [[texture(2)]],
+                           texture2d<float, access::write> depthOut [[texture(3)]],
+                           texture2d<float, access::write> weightOut [[texture(4)]],
+                           texture2d<float, access::write> colorOut [[texture(5)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint ow = depthOut.get_width();
+    uint oh = depthOut.get_height();
+    if (gid.x >= ow || gid.y >= oh) return;
+    uint iw = depthIn.get_width();
+    uint ih = depthIn.get_height();
+    float3 cs = float3(0.0f);
+    float dmax = 0.0f;
+    float n = 0.0f;
+    for (uint dy = 0; dy < 2; dy++) {
+        for (uint dx = 0; dx < 2; dx++) {
+            uint2 q = uint2(min(gid.x * 2 + dx, iw - 1), min(gid.y * 2 + dy, ih - 1));
+            if (weightIn.read(q).r > 0.5f) {
+                cs += colorIn.read(q).rgb;
+                dmax = max(dmax, depthIn.read(q).r);
+                n += 1.0f;
+            }
+        }
+    }
+    if (n > 0.0f) {
+        depthOut.write(dmax, gid);
+        weightOut.write(1.0f, gid);
+        colorOut.write(float4(cs / n, 1.0f), gid);
+    } else {
+        depthOut.write(0.0f, gid);
+        weightOut.write(0.0f, gid);
+        colorOut.write(float4(0.0f), gid);
+    }
+}
+
+// Push (upsample fill): valid pixels pass through bit-exact; holes take the already
+// filled coarser level via DEPTH-LAYER-GATED bilinear: of the 4 coarse taps, only
+// the farthest layer participates (taps nearer than max-depth minus depthBreak are
+// dropped and the bilinear weights renormalized). Smooth between same-layer texels,
+// but foreground depth/color can never bleed into a background reveal (naive
+// bilinear depth resampling across discontinuities stays forbidden).
+kernel void pull_push_up(texture2d<float, access::read> depthIn [[texture(0)]],
+                         texture2d<float, access::read> weightIn [[texture(1)]],
+                         texture2d<float, access::read> colorIn [[texture(2)]],
+                         texture2d<float, access::read> depthCoarse [[texture(3)]],
+                         texture2d<float, access::read> colorCoarse [[texture(4)]],
+                         texture2d<float, access::write> depthOut [[texture(5)]],
+                         texture2d<float, access::write> colorOut [[texture(6)]],
+                         constant HoleSmoothParams &p [[buffer(0)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint w = depthOut.get_width();
+    uint h = depthOut.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    if (weightIn.read(gid).r > 0.5f) {
+        depthOut.write(depthIn.read(gid).r, gid);
+        colorOut.write(colorIn.read(gid), gid);
+        return;
+    }
+    int cw2 = int(depthCoarse.get_width());
+    int ch2 = int(depthCoarse.get_height());
+    float fx = (float(gid.x) + 0.5f) * float(cw2) / float(w) - 0.5f;
+    float fy = (float(gid.y) + 0.5f) * float(ch2) / float(h) - 0.5f;
+    int x0 = int(floor(fx)), y0 = int(floor(fy));
+    float wx = fx - floor(fx), wy = fy - floor(fy);
+    int2 q00 = clamp(int2(x0, y0), int2(0), int2(cw2 - 1, ch2 - 1));
+    int2 q10 = clamp(int2(x0 + 1, y0), int2(0), int2(cw2 - 1, ch2 - 1));
+    int2 q01 = clamp(int2(x0, y0 + 1), int2(0), int2(cw2 - 1, ch2 - 1));
+    int2 q11 = clamp(int2(x0 + 1, y0 + 1), int2(0), int2(cw2 - 1, ch2 - 1));
+    float d00 = depthCoarse.read(uint2(q00)).r;
+    float d10 = depthCoarse.read(uint2(q10)).r;
+    float d01 = depthCoarse.read(uint2(q01)).r;
+    float d11 = depthCoarse.read(uint2(q11)).r;
+    float dmax = max(max(d00, d10), max(d01, d11));
+    float b00 = (1 - wx) * (1 - wy), b10 = wx * (1 - wy);
+    float b01 = (1 - wx) * wy, b11 = wx * wy;
+    b00 *= d00 >= dmax - p.depthThreshold ? 1.0f : 0.0f;
+    b10 *= d10 >= dmax - p.depthThreshold ? 1.0f : 0.0f;
+    b01 *= d01 >= dmax - p.depthThreshold ? 1.0f : 0.0f;
+    b11 *= d11 >= dmax - p.depthThreshold ? 1.0f : 0.0f;
+    float wsum = b00 + b10 + b01 + b11;
+    if (wsum <= 0.0f) {  // unreachable (dmax tap always kept), safety fallback
+        depthOut.write(dmax, gid);
+        colorOut.write(colorCoarse.read(uint2(q00)), gid);
+        return;
+    }
+    float inv = 1.0f / wsum;
+    float d = (b00 * d00 + b10 * d10 + b01 * d01 + b11 * d11) * inv;
+    float3 c = (b00 * colorCoarse.read(uint2(q00)).rgb
+              + b10 * colorCoarse.read(uint2(q10)).rgb
+              + b01 * colorCoarse.read(uint2(q01)).rgb
+              + b11 * colorCoarse.read(uint2(q11)).rgb) * inv;
+    depthOut.write(d, gid);
+    colorOut.write(float4(c, 1.0f), gid);
+}
+
+// Inpainted-band smoothing with PLANE-FIT depth extrapolation: mask=0 pixels only.
+// Depth gradients are the surface-normal field (first-order normal information), so
+// instead of a flat gated average, the same-layer neighbors in a 5x5 window fit a
+// local plane d(dx,dy) = a*dx + b*dy + c (gaussian-weighted least squares) and the
+// hole takes the plane value at its center — background slopes continue smoothly
+// into the reveal instead of terracing. The fit is clamped to the neighbor depth
+// range and depth-layer gated (|dn - dc| <= threshold), so foreground depth can
+// never bleed into the background fill; degenerate windows fall back to the gated
+// 3x3 gaussian average (which also remains the color path). Valid (mask=1) pixels
+// pass through bit-exact; the mask is untouched.
+kernel void hole_smooth(texture2d<float, access::read> depthIn [[texture(0)]],
+                        texture2d<float, access::read> maskIn [[texture(1)]],
+                        texture2d<float, access::read> colorIn [[texture(2)]],
+                        texture2d<float, access::write> depthOut [[texture(3)]],
+                        texture2d<float, access::write> colorOut [[texture(4)]],
+                        constant HoleSmoothParams &p [[buffer(0)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    int w = int(depthIn.get_width());
+    int h = int(depthIn.get_height());
+    if (int(gid.x) >= w || int(gid.y) >= h) return;
+    float dc = depthIn.read(gid).r;
+    float4 c = colorIn.read(gid);
+    if (maskIn.read(gid).r > 0.5f) {
+        depthOut.write(dc, gid);
+        colorOut.write(c, gid);
+        return;
+    }
+    // color: gated 3x3 gaussian average (unchanged)
+    float3 cs = float3(0.0f);
+    float cwsum = 0.0f;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(w - 1, h - 1));
+            float dn = depthIn.read(uint2(q)).r;
+            if (abs(dn - dc) > p.depthThreshold) continue;
+            float wgt = float((2 - abs(dx)) * (2 - abs(dy)));
+            cs += colorIn.read(uint2(q)).rgb * wgt;
+            cwsum += wgt;
+        }
+    }
+    // depth: gated 5x5 plane fit (gaussian weights (3-|d|) separable)
+    float sxx = 0.0f, sxy = 0.0f, sx = 0.0f, syy = 0.0f, sy = 0.0f, n = 0.0f;
+    float sxd = 0.0f, syd = 0.0f, sd = 0.0f;
+    float dmin = 1e30f, dmax = -1e30f;
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(w - 1, h - 1));
+            float dn = depthIn.read(uint2(q)).r;
+            if (abs(dn - dc) > p.depthThreshold) continue;
+            float wgt = float((3 - abs(dx)) * (3 - abs(dy)));
+            float x = float(dx), y = float(dy);
+            sxx += wgt * x * x; sxy += wgt * x * y; sx += wgt * x;
+            syy += wgt * y * y; sy += wgt * y; n += wgt;
+            sxd += wgt * x * dn; syd += wgt * y * dn; sd += wgt * dn;
+            dmin = min(dmin, dn); dmax = max(dmax, dn);
+        }
+    }
+    float df;
+    // normal equations of the weighted plane fit (symmetric 3x3), Cramer solve
+    float m00 = sxx, m01 = sxy, m02 = sx;
+    float m11 = syy, m12 = sy, m22 = n;
+    float c01 = m01 * m22 - m02 * m12;   // cofactors
+    float c02 = m01 * m12 - m02 * m11;
+    float c12 = m00 * m12 - m01 * m02;
+    float det = m00 * (m11 * m22 - m12 * m12) - m01 * c01 + m02 * c02;
+    if (n >= 4.0f && abs(det) > 1e-3f * n * n * n) {
+        // c = det([M | rhs] with column 3 replaced) / det
+        float det3 = m00 * (m11 * sd - m12 * syd)
+                   - m01 * (m01 * sd - m02 * syd)
+                   + sxd * (m01 * m12 - m02 * m11);
+        df = clamp(det3 / det, dmin, dmax);
+    } else if (n > 0.0f) {
+        df = sd / n;
+    } else {
+        df = dc;
+    }
+    depthOut.write(df, gid);
+    colorOut.write(cwsum > 0.0f ? float4(cs / cwsum, 1.0f) : c, gid);
 }

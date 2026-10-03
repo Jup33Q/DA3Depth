@@ -57,6 +57,10 @@ final class AppState: ObservableObject {
         var mask: [Float]
         var width: Int
         var height: Int
+        /// gray16 normalization basis = source depth min/max (same as the plain
+        /// gray16 export), so warped_depth16 stays comparable to the original.
+        var depthLo: Float
+        var depthHi: Float
     }
     var warped: WarpedResult?
 
@@ -133,8 +137,10 @@ final class AppState: ObservableObject {
         return "已导出: \(url.lastPathComponent)（\(up.width)x\(up.height)）"
     }
 
-    /// Export the latest reproject_view output: warped RGB / warped gray16 depth
-    /// (normalized over mask-valid pixels, holes = 0) / validity mask.
+    /// Export the latest reproject_view output: warped RGB / warped gray16 depth /
+    /// validity mask. The warped depth is pull-push filled (no zero holes) and
+    /// normalized over the SOURCE depth min/max (w.depthLo...w.depthHi, the same
+    /// basis as the plain gray16 export); mask=0 marks the inpainted disocclusion.
     private func exportWarped(_ kind: ExportKind, to url: URL) throws -> String {
         guard let w = warped else {
             throw DepthEngine.EngineError.badImage
@@ -144,15 +150,13 @@ final class AppState: ObservableObject {
         case .warped_color:
             cg = Self.rgbaCGImage(w.rgba, width: w.width, height: w.height)
         case .warped_depth16:
-            var lo = Float.greatestFiniteMagnitude, hi = -Float.greatestFiniteMagnitude
-            for i in 0..<w.depth.count where w.mask[i] > 0.5 {
-                lo = min(lo, w.depth[i]); hi = max(hi, w.depth[i])
-            }
+            let lo = w.depthLo, hi = w.depthHi
             guard hi > lo else { throw DepthEngine.EngineError.badImage }
             let inv = 1 / (hi - lo)
             var words = [UInt16](repeating: 0, count: w.depth.count)
-            for i in 0..<w.depth.count where w.mask[i] > 0.5 {
-                words[i] = UInt16(min(65535, max(0, ((w.depth[i] - lo) * inv * 65535).rounded())))
+            for i in 0..<w.depth.count {
+                let v = min(max(w.depth[i], lo), hi)
+                words[i] = UInt16(min(65535, max(0, ((v - lo) * inv * 65535).rounded())))
             }
             cg = words.withUnsafeMutableBytes { ptr in
                 guard let provider = CGDataProvider(data: Data(bytes: ptr.baseAddress!, count: ptr.count) as CFData)
@@ -211,10 +215,12 @@ final class AppState: ObservableObject {
                                                yawDeg: yawDeg, pitchDeg: pitchDeg,
                                                fillRadius: fillHoles ? 4 : 0,
                                                softenEdges: softenEdges)
-        warped = WarpedResult(rgba: r.rgba, depth: r.depth, mask: r.mask, width: w, height: h)
-        let msg = String(format: "已重投影: yaw %.2f°→%.2f° pitch %.2f°→%.2f° · %dx%d · %d 微步 · 覆盖率 %.1f%%",
+        let lo = d.values.min() ?? 0, hi = d.values.max() ?? 1
+        warped = WarpedResult(rgba: r.rgba, depth: r.depth, mask: r.mask, width: w,
+                              height: h, depthLo: lo, depthHi: hi)
+        let msg = String(format: "已重投影: yaw %.2f°→%.2f° pitch %.2f°→%.2f° · %dx%d · %d 微步 · 覆盖率 %.1f%% · depth16 归一化基准 [%.4g, %.4g]（源深度 min/max，与 gray16 一致；mask=0 为 pull-push 填补区）",
                          yawDeg, r.appliedYaw, pitchDeg, r.appliedPitch, w, h, r.steps,
-                         r.coverage * 100)
+                         r.coverage * 100, lo, hi)
         status = msg
         return msg
     }

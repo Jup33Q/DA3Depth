@@ -8,12 +8,12 @@ then drives the acceptance chain over JSON-RPC on the two validation assets
     load_image -> reproject_view{yaw_deg} -> export warped_color + warped_depth16 + warped_mask
 
 Gates:
-  - reproject_view reports >=90% coverage and 1 micro-step at yaw=5 (step limit 5 deg)
-  - recursion: yaw 12 runs as 3 micro-steps; clamp: yaw 45 clamps to 30 deg
+  - reproject_view reports >=80% coverage and 5 micro-steps at yaw=5 (step limit 1 deg)
+  - recursion: yaw 12 runs as 12 micro-steps; clamp: yaw 45 clamps to 30 deg
   - exports exist, PNG dims == 1152x1536
   - warped color differs from the source frame (warp actually applied)
   - determinism: repeating the yaw +5 chain gives byte-identical PNGs
-  - coverage < 100% (mask actually marks the unfilled big holes)
+  - coverage < 100% (mask actually marks the inpainted disocclusion band)
 
 Outputs land in ~/Desktop/videos/01/_reset/reproject-m10/ for LKG parallax pairing.
 Exits 0 on M10 PASS, 1 on any failure. The app process is always killed.
@@ -129,22 +129,22 @@ def main():
 
         # recursion / clamp gates on the first frame
         tool("load_image", {"path": os.path.join(ASSETS, FRAMES["first"])}, timeout=300)
-        t12 = tool("reproject_view", {"yaw_deg": 12})
-        gate(steps_of(t12) == 3, f"yaw 12 -> 3 micro-steps (got {steps_of(t12)})")
-        t45 = tool("reproject_view", {"yaw_deg": 45})
-        gate("yaw 45.00°→30.00°" in t45 and steps_of(t45) == 6,
-             "yaw 45 clamped to 30 (6 micro-steps)")
+        t12 = tool("reproject_view", {"yaw_deg": 12}, timeout=300)
+        gate(steps_of(t12) == 12, f"yaw 12 -> 12 micro-steps (got {steps_of(t12)})")
+        t45 = tool("reproject_view", {"yaw_deg": 45}, timeout=300)
+        gate("yaw 45.00°→30.00°" in t45 and steps_of(t45) == 30,
+             "yaw 45 clamped to 30 (30 micro-steps)")
 
         for name, fname in FRAMES.items():
             tool("load_image", {"path": os.path.join(ASSETS, fname)}, timeout=300)
             for yaw, tag in ((5, "p5"), (-5, "m5")):
-                t = tool("reproject_view", {"yaw_deg": yaw})
+                t = tool("reproject_view", {"yaw_deg": yaw}, timeout=300)
                 cov = coverage_of(t)
-                # at 5° yaw the out-of-frame / disocclusion band is a big hole that
-                # must stay masked (not filled), so ~80-90% coverage is expected
+                # the disocclusion / out-of-frame band is inpainted but must stay
+                # marked mask=0, so coverage stays below 100%
                 gate(cov is not None and 80.0 <= cov < 100.0,
                      f"{name} yaw{yaw:+} coverage {cov}% in [80, 100)")
-                gate(steps_of(t) == 1, f"{name} yaw{yaw:+} single micro-step")
+                gate(steps_of(t) == 5, f"{name} yaw{yaw:+} -> 5 micro-steps")
                 outs = {}
                 for kind, suffix in (("warped_color", "color"), ("warped_depth16", "depth16"),
                                      ("warped_mask", "mask")):

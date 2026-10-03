@@ -36,11 +36,14 @@ public final class GPUContext {
     }
 
     /// Cached render pipeline for point-sprite splatting passes (color attachments +
-    /// a depth attachment that provides the hardware z-test — no atomics).
+    /// an optional depth attachment that provides the hardware z-test — no atomics).
+    /// `blending` enables additive (one/one) blending on all color attachments for
+    /// the gaussian accumulation pass.
     func renderPipeline(vertex vfName: String, fragment ffName: String,
                         colorFormats: [MTLPixelFormat],
-                        depthFormat: MTLPixelFormat) throws -> MTLRenderPipelineState {
-        let key = "\(vfName)|\(ffName)|\(colorFormats.map(\.rawValue))|\(depthFormat.rawValue)"
+                        depthFormat: MTLPixelFormat?,
+                        blending: Bool = false) throws -> MTLRenderPipelineState {
+        let key = "\(vfName)|\(ffName)|\(colorFormats.map(\.rawValue))|\(depthFormat?.rawValue ?? 0)|\(blending)"
         if let cached = renderPipelines[key] { return cached }
         guard let library = try? device.makeDefaultLibrary(bundle: .module) else {
             throw DepthShaderError.libraryUnavailable
@@ -54,8 +57,18 @@ public final class GPUContext {
         descriptor.fragmentFunction = ff
         for (i, format) in colorFormats.enumerated() {
             descriptor.colorAttachments[i].pixelFormat = format
+            if blending {
+                let a = descriptor.colorAttachments[i]!
+                a.isBlendingEnabled = true
+                a.sourceRGBBlendFactor = .one
+                a.destinationRGBBlendFactor = .one
+                a.sourceAlphaBlendFactor = .one
+                a.destinationAlphaBlendFactor = .one
+            }
         }
-        descriptor.depthAttachmentPixelFormat = depthFormat
+        if let depthFormat {
+            descriptor.depthAttachmentPixelFormat = depthFormat
+        }
         let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
         renderPipelines[key] = pipeline
         return pipeline

@@ -157,11 +157,15 @@ struct LCG {
     }
 }
 
-// CPU reference for the M7 reprojection splat pass + hole fill, kept in sync with
+// CPU reference for the M7 reprojection splat passes + hole fill, kept in sync with
 // Tests/DepthShaderKitTests/ReprojectTests.swift. Same pinhole back-projection,
-// yaw/pitch rotation about the pivot plane, splat rounding floor(u' + 0.5),
-// strict-less z-buffer (first-drawn wins ties, like the GPU compare-less depth test),
-// 8-neighborhood diffusion fill.
+// yaw/pitch rotation about the pivot plane, adaptive disc splat footprint
+// (ps = clamp(ceil(hypot(distR, distD)), 1, 8); |q - u'| <= ps/2 euclidean), pass-A
+// nearest-depth visibility, pass-B gaussian accumulation gated by dz <= depthBreak
+// (sigma = depthBreak/3) in vertex order, pass-C normalize (mask = weight > 1e-3),
+// 8-neighborhood diffusion fill, then pull-push pyramid fill (depth: max pull +
+// depth-layer-gated bilinear push — farthest-depth discipline) and depth-gated
+// band smoothing.
 func cpuReproject(depth src: [Float], width sw: Int, height sh: Int,
                   canvas cw: Int, _ ch: Int,
                   params: ReprojectParams) -> (depth: [Float], mask: [Float]) {
@@ -171,37 +175,114 @@ func cpuReproject(depth src: [Float], width sw: Int, height sh: Int,
     let cx = Float(cw - 1) / 2, cy = Float(ch - 1) / 2
     let yaw = params.yawDeg * .pi / 180, pitch = params.pitchDeg * .pi / 180
     let cyw = cos(yaw), syw = sin(yaw), cpt = cos(pitch), spt = sin(pitch)
+    let depthBreak = 0.05 * pivotZ
+    let splatMax: Float = 8
 
-    var zbuf = [Float](repeating: .infinity, count: cw * ch)
-    var depth = [Float](repeating: 0, count: cw * ch)
-    var mask = [Float](repeating: 0, count: cw * ch)
+    func project(_ u: Int, _ v: Int, _ d: Float) -> (Float, Float, Float)? {
+        let X = (Float(u) - cx) * d / f
+        let Y = -(Float(v) - cy) * d / f
+        let Zc = pivotZ - d
+        let X1 = X * cyw + Zc * syw
+        let Z1 = -X * syw + Zc * cyw
+        let Y1 = Y * cpt - Z1 * spt
+        let Z2 = Y * spt + Z1 * cpt
+        let dp = pivotZ - Z2
+        guard dp > 1e-6, dp / zMax < 1 else { return nil }
+        return (f * X1 / dp + cx, cy - f * Y1 / dp, dp)
+    }
+
+    var splatU = [Float](repeating: 0, count: cw * ch)
+    var splatV = [Float](repeating: 0, count: cw * ch)
+    var splatD = [Float](repeating: 0, count: cw * ch)
+    var splatPS = [Float](repeating: 0, count: cw * ch)
+    var splatOK = [Bool](repeating: false, count: cw * ch)
 
     for v in 0..<ch {
         for u in 0..<cw {
             let su = min(Int((Float(u) + 0.5) * Float(sw) / Float(cw)), sw - 1)
             let sv = min(Int((Float(v) + 0.5) * Float(sh) / Float(ch)), sh - 1)
             let d = src[sv * sw + su]
-            // X right, Y up, Z out of screen (camera looks along -Z, so Z = -d)
-            let X = (Float(u) - cx) * d / f
-            let Y = -(Float(v) - cy) * d / f
-            let Zc = pivotZ - d
-            let X1 = X * cyw + Zc * syw
-            let Z1 = -X * syw + Zc * cyw
-            let Y1 = Y * cpt - Z1 * spt
-            let Z2 = Y * spt + Z1 * cpt
-            let dp = pivotZ - Z2           // depth after rotation
-            guard dp > 1e-6, dp / zMax < 1 else { continue }
-            let up = f * X1 / dp + cx
-            let vp = cy - f * Y1 / dp
-            let px = Int(floor(up + 0.5)), py = Int(floor(vp + 0.5))
-            guard px >= 0, px < cw, py >= 0, py < ch else { continue }
-            let i = py * cw + px
-            if dp < zbuf[i] {
-                zbuf[i] = dp
-                depth[i] = dp
-                mask[i] = 1
+            guard let (up, vp, dp) = project(u, v, d) else { continue }
+            var distR: Float = 0, distD: Float = 0
+            if u + 1 < cw {
+                let nsu = min(Int((Float(u + 1) + 0.5) * Float(sw) / Float(cw)), sw - 1)
+                let dn = src[sv * sw + nsu]
+                if abs(dn - d) <= depthBreak, let q = project(u + 1, v, dn) {
+                    distR = hypot(q.0 - up, q.1 - vp)
+                }
+            }
+            if v + 1 < ch {
+                let nsv = min(Int((Float(v + 1) + 0.5) * Float(sh) / Float(ch)), sh - 1)
+                let dn = src[nsv * sw + su]
+                if abs(dn - d) <= depthBreak, let q = project(u, v + 1, dn) {
+                    distD = hypot(q.0 - up, q.1 - vp)
+                }
+            }
+            let ps = min(max(ceil(hypot(distR, distD) - 1e-3), 1), splatMax)
+            let i = v * cw + u
+            splatU[i] = up; splatV[i] = vp; splatD[i] = dp; splatPS[i] = ps
+            splatOK[i] = true
+        }
+    }
+
+    // pass A: nearest depth per pixel over the disc footprints (hardware z-test)
+    var za = [Float](repeating: .infinity, count: cw * ch)
+    for v in 0..<ch {
+        for u in 0..<cw {
+            let i = v * cw + u
+            guard splatOK[i] else { continue }
+            let up = splatU[i], vp = splatV[i], dp = splatD[i], ps = splatPS[i]
+            let half = ps / 2
+            let qx0 = max(0, Int(ceil(up - half))), qx1 = min(cw - 1, Int(floor(up + half)))
+            let qy0 = max(0, Int(ceil(vp - half))), qy1 = min(ch - 1, Int(floor(vp + half)))
+            guard qx0 <= qx1, qy0 <= qy1 else { continue }
+            for py in qy0...qy1 {
+                for px in qx0...qx1 {
+                    let r2 = (Float(px) - up) * (Float(px) - up)
+                           + (Float(py) - vp) * (Float(py) - vp)
+                    guard r2 <= half * half else { continue }
+                    let j = py * cw + px
+                    if dp < za[j] { za[j] = dp }
+                }
             }
         }
+    }
+
+    // pass B: gated gaussian accumulation in vertex order (API-ordered blending)
+    var sumW = [Float](repeating: 0, count: cw * ch)
+    var sumD = [Float](repeating: 0, count: cw * ch)
+    let sigma = depthBreak / 3
+    for v in 0..<ch {
+        for u in 0..<cw {
+            let i = v * cw + u
+            guard splatOK[i] else { continue }
+            let up = splatU[i], vp = splatV[i], dp = splatD[i], ps = splatPS[i]
+            let half = ps / 2
+            let qx0 = max(0, Int(ceil(up - half))), qx1 = min(cw - 1, Int(floor(up + half)))
+            let qy0 = max(0, Int(ceil(vp - half))), qy1 = min(ch - 1, Int(floor(vp + half)))
+            guard qx0 <= qx1, qy0 <= qy1 else { continue }
+            for py in qy0...qy1 {
+                for px in qx0...qx1 {
+                    let r2 = (Float(px) - up) * (Float(px) - up)
+                           + (Float(py) - vp) * (Float(py) - vp)
+                    guard r2 <= half * half else { continue }
+                    let j = py * cw + px
+                    let dz = max(dp - za[j], 0)
+                    guard dz <= depthBreak else { continue }
+                    let w = exp(-4 * r2 / (half * half)) * exp(-0.5 * dz * dz / (sigma * sigma))
+                    sumW[j] += w
+                    sumD[j] += dp * w
+                }
+            }
+        }
+    }
+
+    // pass C: normalize
+    var depth = [Float](repeating: 0, count: cw * ch)
+    var mask = [Float](repeating: 0, count: cw * ch)
+    for i in 0..<cw * ch where sumW[i] > 1e-3 {
+        mask[i] = 1
+        depth[i] = sumD[i] / sumW[i]
     }
 
     for _ in 0..<max(0, params.fillRadius) {
@@ -222,6 +303,117 @@ func cpuReproject(depth src: [Float], width sw: Int, height sh: Int,
             }
         }
         depth = nd; mask = nm
+    }
+
+    // pull-push pyramid fill (depth only: farthest-depth pull, gated bilinear push)
+    var dims = [(cw, ch)]
+    while dims.last!.0 > 1 || dims.last!.1 > 1 {
+        let (w, h) = dims.last!
+        dims.append((max(1, (w + 1) / 2), max(1, (h + 1) / 2)))
+    }
+    if dims.count > 1 {
+        var dL = [depth], wL = [mask]
+        for l in 1..<dims.count {
+            let (iw, ih) = dims[l - 1]
+            let (ow, oh) = dims[l]
+            var dO = [Float](repeating: 0, count: ow * oh)
+            var wO = [Float](repeating: 0, count: ow * oh)
+            for y in 0..<oh {
+                for x in 0..<ow {
+                    var dmax: Float = 0, n: Float = 0
+                    for dy in 0..<2 {
+                        for dx in 0..<2 {
+                            let qx = min(x * 2 + dx, iw - 1), qy = min(y * 2 + dy, ih - 1)
+                            let j = qy * iw + qx
+                            if wL[l - 1][j] > 0.5 { dmax = max(dmax, dL[l - 1][j]); n += 1 }
+                        }
+                    }
+                    let i = y * ow + x
+                    if n > 0 { dO[i] = dmax; wO[i] = 1 }
+                }
+            }
+            dL.append(dO); wL.append(wO)
+        }
+        var fillD = dL[dims.count - 1]
+        for l in stride(from: dims.count - 2, through: 0, by: -1) {
+            let (wf, hf) = dims[l]
+            let (wc, hc) = dims[l + 1]
+            var dO = dL[l]
+            for y in 0..<hf {
+                for x in 0..<wf {
+                    let i = y * wf + x
+                    if wL[l][i] > 0.5 { continue }
+                    // depth-layer-gated bilinear (farthest layer only, renormalized)
+                    let fx = (Float(x) + 0.5) * Float(wc) / Float(wf) - 0.5
+                    let fy = (Float(y) + 0.5) * Float(hc) / Float(hf) - 0.5
+                    let x0 = Int(floor(fx)), y0 = Int(floor(fy))
+                    let wx = fx - floor(fx), wy = fy - floor(fy)
+                    let q00 = (min(max(y0, 0), hc - 1)) * wc + (min(max(x0, 0), wc - 1))
+                    let q10 = (min(max(y0, 0), hc - 1)) * wc + (min(max(x0 + 1, 0), wc - 1))
+                    let q01 = (min(max(y0 + 1, 0), hc - 1)) * wc + (min(max(x0, 0), wc - 1))
+                    let q11 = (min(max(y0 + 1, 0), hc - 1)) * wc + (min(max(x0 + 1, 0), wc - 1))
+                    let d00 = fillD[q00], d10 = fillD[q10], d01 = fillD[q01], d11 = fillD[q11]
+                    let dmax = max(max(d00, d10), max(d01, d11))
+                    var b00 = (1 - wx) * (1 - wy), b10 = wx * (1 - wy)
+                    var b01 = (1 - wx) * wy, b11 = wx * wy
+                    b00 *= d00 >= dmax - depthBreak ? 1 : 0
+                    b10 *= d10 >= dmax - depthBreak ? 1 : 0
+                    b01 *= d01 >= dmax - depthBreak ? 1 : 0
+                    b11 *= d11 >= dmax - depthBreak ? 1 : 0
+                    let wsum = b00 + b10 + b01 + b11
+                    if wsum <= 0 { dO[i] = dmax; continue }
+                    dO[i] = (b00 * d00 + b10 * d10 + b01 * d01 + b11 * d11) / wsum
+                }
+            }
+            fillD = dO
+        }
+        depth = fillD
+    }
+
+    // inpainted-band smoothing: 2 iterations, mask=0 pixels only, gated 5x5 plane fit
+    if dims.count > 1 {
+        for _ in 0..<2 {
+            var nd = depth
+            for y in 0..<ch {
+                for x in 0..<cw {
+                    let i = y * cw + x
+                    if mask[i] > 0.5 { continue }
+                    let dc = depth[i]
+                    var sxx: Float = 0, sxy: Float = 0, sx: Float = 0
+                    var syy: Float = 0, sy: Float = 0, n: Float = 0
+                    var sxd: Float = 0, syd: Float = 0, sd: Float = 0
+                    var dmin = Float.greatestFiniteMagnitude
+                    var dmax = -Float.greatestFiniteMagnitude
+                    for dy in -2...2 {
+                        for dx in -2...2 {
+                            let qx = min(max(x + dx, 0), cw - 1), qy = min(max(y + dy, 0), ch - 1)
+                            let dn = depth[qy * cw + qx]
+                            if abs(dn - dc) > depthBreak { continue }
+                            let wgt = Float((3 - abs(dx)) * (3 - abs(dy)))
+                            let fx = Float(dx), fy = Float(dy)
+                            sxx += wgt * fx * fx; sxy += wgt * fx * fy; sx += wgt * fx
+                            syy += wgt * fy * fy; sy += wgt * fy; n += wgt
+                            sxd += wgt * fx * dn; syd += wgt * fy * dn; sd += wgt * dn
+                            dmin = min(dmin, dn); dmax = max(dmax, dn)
+                        }
+                    }
+                    let m00 = sxx, m01 = sxy, m02 = sx
+                    let m11 = syy, m12 = sy, m22 = n
+                    let c01 = m01 * m22 - m02 * m12
+                    let c02 = m01 * m12 - m02 * m11
+                    let det = m00 * (m11 * m22 - m12 * m12) - m01 * c01 + m02 * c02
+                    if n >= 4 && abs(det) > 1e-3 * n * n * n {
+                        let det3 = m00 * (m11 * sd - m12 * syd)
+                                 - m01 * (m01 * sd - m02 * syd)
+                                 + sxd * (m01 * m12 - m02 * m11)
+                        nd[i] = min(max(det3 / det, dmin), dmax)
+                    } else if n > 0 {
+                        nd[i] = sd / n
+                    }
+                }
+            }
+            depth = nd
+        }
     }
     return (depth, mask)
 }
@@ -463,6 +655,24 @@ do {
               [Float(r.mismatchFraction)], [0], tolerance: 2e-2)
         check("reproject 2plane depth", "\(sw)x\(sh) yaw-5 pitch2 fill3",
               [Float(r.maxDepthDiff)], [0], tolerance: 2e-2)
+    }
+
+    // M7-fix: pull-push fill depth matches the CPU reference (gaussian accumulation
+    // cancels to the flat value mathematically; allow ulp noise), mask exact.
+    do {
+        let (w, h) = (64, 64)
+        var depth = [Float](repeating: 3, count: w * h)
+        for y in 30..<32 { for x in 30..<32 { depth[y * w + x] = 0 } }
+        for y in 40..<60 { for x in 40..<60 { depth[y * w + x] = 0 } }
+        let p = ReprojectParams(yawDeg: 0, fillRadius: 3, softenEdges: false)
+        let gpu = try ops.reproject(values: depth, width: w, height: h,
+                                    colorRGBA: colorPatternRGBA(width: w, height: h),
+                                    canvasWidth: w, canvasHeight: h, params: p)
+        let cpu = cpuReproject(depth: depth, width: w, height: h, canvas: w, h, params: p)
+        check("reproject fill depth", "\(w)x\(h) carved yaw0 fill3", gpu.depth, cpu.depth,
+              tolerance: 1e-5)
+        check("reproject fill mask", "\(w)x\(h) carved yaw0 fill3", gpu.mask, cpu.mask,
+              tolerance: 0)
     }
 }
 

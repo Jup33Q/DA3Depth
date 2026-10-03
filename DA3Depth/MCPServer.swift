@@ -94,7 +94,7 @@ final class MCPServer: @unchecked Sendable {
          "inputSchema": ["type": "object", "properties": ["value": ["type": "boolean"]], "required": ["value"]]],
         ["name": "set_mode", "description": "Display mode gray|color",
          "inputSchema": ["type": "object", "properties": ["mode": ["type": "string"]], "required": ["mode"]]],
-        ["name": "export", "description": "Export PNG: kind gray8|color8|gray16 (depth) or warped_color|warped_depth16|warped_mask (latest reproject_view output) to path",
+        ["name": "export", "description": "Export PNG: kind gray8|color8|gray16 (depth) or warped_color|warped_depth16|warped_mask (latest reproject_view output) to path. warped_depth16 is pull-push filled (no zero holes) and normalized to the source depth min/max — the same basis as gray16; warped_mask marks inpainted disocclusion as 0",
          "inputSchema": ["type": "object", "properties": ["kind": ["type": "string"], "path": ["type": "string"]], "required": ["kind", "path"]]],
         ["name": "status", "description": "Current state (image, depth dims, inference ms)",
          "inputSchema": ["type": "object", "properties": [:]]],
@@ -113,7 +113,7 @@ final class MCPServer: @unchecked Sendable {
         ["name": "edit_redo", "description": "Redo last undone transform edit",
          "inputSchema": ["type": "object", "properties": [:]]],
         ["name": "reproject_view",
-         "description": "2.5D out-of-plane reprojection: yaw/pitch the viewpoint through the pivot depth plane and splat back (hardware z-test, RGB+depth paired). Angles clamp to ±30° and run as recursive <=5° micro-steps. fill_holes (default true) diffuses small disocclusion holes; big holes stay mask=0. soften_edges (default true) blurs jagged splat edges on the color. Export results via export kind warped_color|warped_depth16|warped_mask.",
+         "description": "2.5D out-of-plane reprojection: yaw/pitch the viewpoint through the pivot depth plane and splat back (two-pass gaussian visibility splatting, RGB+depth paired). Angles clamp to ±30° and run as recursive <=1° micro-steps so chained hole filling tracks real content. fill_holes (default true) diffuses small holes into the valid mask; all remaining holes are pull-push filled in color and depth (farthest-depth discipline) with mask kept 0. soften_edges (default true) blurs jagged splat edges on the color. Export results via export kind warped_color|warped_depth16|warped_mask.",
          "inputSchema": ["type": "object", "properties": [
             "yaw_deg": ["type": "number"], "pitch_deg": ["type": "number"],
             "fill_holes": ["type": "boolean"], "soften_edges": ["type": "boolean"]],
