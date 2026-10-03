@@ -53,10 +53,14 @@
 - `MCPServer` 新增工具：`transform_depth{rotate,translate,scale,z_shift}`、`fuse_depth{layers}`、`edit_reset`
 - 验收：MCP 脚本完成「推理→变换→融合→导出」全链路；UI 操作与 MCP 结果逐像素一致
 
-### M7 —（二期，可选）2.5D 面外重投影
-- 面外旋转/视差位移：深度反投影 → point sprite splatting（走光栅化 z-test，不用原子操作）
-- 小洞邻域扩散填补；大洞留到 LDI / inpainting（另立项）
-- 仅在 M1–M6 全部验收后启动
+### M7 — 2.5D 面外重投影 ✅（2026-10-03 验收）
+- [x] 面外旋转/视差位移：深度反投影 → point sprite splatting（渲染管线 depth32Float 附件走硬件 z-test，无原子操作）。坐标约定：X 横轴（右）、Y 竖轴（上）、Z 朝屏幕外（相机沿 -Z 看，深度 d → Z=-d）；绕 pivot 深度面 yaw（竖轴）+ 可选 pitch（横轴）；正 yaw 内容左移
+- [x] 同一 splat pass 输出变形彩图（rgba16Float）+ 变形深度 + 有效区 mask，共享 z-test 配对；源深度最近邻上采样到画布分辨率（禁双线性），彩图全分辨率采样
+- [x] 小洞邻域扩散填补（8 邻域均值，`fillRadius` 轮）；大洞不处理，mask=0 标出（LDI/inpainting 另立项）
+- [x] 限位 + 微动 + 递归：单步 ≤5°（`maxStepDeg`），单轴总量 clamp ±30°（`maxTotalDeg`）；超限时拆成等角微步递归链式重投影（pivot 固定为首帧均值深度）；`edge_soften` kernel 在洞缘/深度断层处做 3×3 高斯半强度糊化弥补 splat 锐边
+- [x] MCP `reproject_view{yaw_deg, pitch_deg?, fill_holes?, soften_edges?}`；export 新增 `warped_color|warped_depth16|warped_mask`（depth16 按 mask 有效区归一化）
+- [x] CPU parity：`Tests/.../ReprojectTests.swift` + `depthshader-parity` 双份参考，逐像素对齐（splat 边界 ±1px 容差）；`tools/m10_reproject_chain.py` 一键验收
+- 验收记录：swift test 29 项全绿；m7_shader_parity 18/18 PASS（yaw5 depth max diff 4.8e-7）；m8 bench 4K 单次重投影 GPU 5.2ms（wall 25ms，与其他 kernel 同属毫秒级）；m10 全 PASS——首尾帧各 ±5° 导出 1152×1536 变形彩图/gray16 深度/mask 至 `~/Desktop/videos/01/_reset/reproject-m10/`，覆盖率 84.7–89.1%（入画边缘带为大洞正确留空），重复链路字节级一致；yaw12→3 微步、yaw45→clamp 30°；m9 链路回归 PASS
 
 ## 工程约定
 

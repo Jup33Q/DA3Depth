@@ -54,4 +54,21 @@ actor EditEngine {
         guard let stack, try stack.redo() else { return nil }
         return (stack.canvas.readback(), stack.canUndo, stack.canRedo)
     }
+
+    /// 2.5D reprojection (M7). `depthValues` at (depthWidth x depthHeight) is
+    /// nearest-upsampled onto the input-resolution canvas; `rgba` is canvas-sized.
+    /// Angles are clamped to ±30° and applied recursively in <=5° micro-steps.
+    func reproject(depthValues: [Float], depthWidth: Int, depthHeight: Int,
+                   rgba: [UInt8], canvasWidth: Int, canvasHeight: Int,
+                   yawDeg: Float, pitchDeg: Float, fillRadius: Int, softenEdges: Bool) throws
+        -> (rgba: [UInt8], depth: [Float], mask: [Float], coverage: Float,
+            steps: Int, appliedYaw: Float, appliedPitch: Float) {
+        let src = try DepthTexture(values: depthValues, width: depthWidth, height: depthHeight)
+        let result = try DepthOps().reprojectView(
+            depth: src, colorRGBA: rgba, canvasWidth: canvasWidth, canvasHeight: canvasHeight,
+            params: ReprojectParams(yawDeg: yawDeg, pitchDeg: pitchDeg,
+                                    fillRadius: fillRadius, softenEdges: softenEdges))
+        return (result.colorRGBA8(), result.depth.readback(), result.mask.readback(),
+                result.coverage, result.steps, result.appliedYawDeg, result.appliedPitchDeg)
+    }
 }

@@ -109,6 +109,16 @@ kernels.append(bench("guided", gpu: true) {
     _ = try ops.guidedSmooth(fused, params: GuidedFilterParams(radius: 2, depthThreshold: 1.0))
 })
 
+// M7: 2.5D reprojection splat (render-pipeline z-test) + fill + soften, 4K canvas
+var colorRGBA = [UInt8](repeating: 128, count: width * height * 4)
+for i in stride(from: 3, to: width * height * 4, by: 4) { colorRGBA[i] = 255 }
+let reprojectSrc = try DepthTexture(values: values, width: width, height: height)
+kernels.append(bench("reproject", gpu: true) {
+    _ = try ops.reprojectView(depth: reprojectSrc, colorRGBA: colorRGBA,
+                              canvasWidth: width, canvasHeight: height,
+                              params: ReprojectParams(yawDeg: 5, fillRadius: 3))
+})
+
 // M4: simulate a rotation-handle drag — base layer + 1200x800 top layer,
 // 60 steps of 0.5 degrees with dirty-tile re-render per step.
 let srcW = 1200, srcH = 800

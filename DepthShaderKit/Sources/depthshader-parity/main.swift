@@ -157,6 +157,123 @@ struct LCG {
     }
 }
 
+// CPU reference for the M7 reprojection splat pass + hole fill, kept in sync with
+// Tests/DepthShaderKitTests/ReprojectTests.swift. Same pinhole back-projection,
+// yaw/pitch rotation about the pivot plane, splat rounding floor(u' + 0.5),
+// strict-less z-buffer (first-drawn wins ties, like the GPU compare-less depth test),
+// 8-neighborhood diffusion fill.
+func cpuReproject(depth src: [Float], width sw: Int, height sh: Int,
+                  canvas cw: Int, _ ch: Int,
+                  params: ReprojectParams) -> (depth: [Float], mask: [Float]) {
+    let pivotZ = params.pivotZ ?? src.reduce(0, +) / Float(src.count)
+    let zMax = max((src.max() ?? 1) * 2, pivotZ * 4, 1e-3)
+    let f = params.focal ?? Float(max(cw, ch))
+    let cx = Float(cw - 1) / 2, cy = Float(ch - 1) / 2
+    let yaw = params.yawDeg * .pi / 180, pitch = params.pitchDeg * .pi / 180
+    let cyw = cos(yaw), syw = sin(yaw), cpt = cos(pitch), spt = sin(pitch)
+
+    var zbuf = [Float](repeating: .infinity, count: cw * ch)
+    var depth = [Float](repeating: 0, count: cw * ch)
+    var mask = [Float](repeating: 0, count: cw * ch)
+
+    for v in 0..<ch {
+        for u in 0..<cw {
+            let su = min(Int((Float(u) + 0.5) * Float(sw) / Float(cw)), sw - 1)
+            let sv = min(Int((Float(v) + 0.5) * Float(sh) / Float(ch)), sh - 1)
+            let d = src[sv * sw + su]
+            // X right, Y up, Z out of screen (camera looks along -Z, so Z = -d)
+            let X = (Float(u) - cx) * d / f
+            let Y = -(Float(v) - cy) * d / f
+            let Zc = pivotZ - d
+            let X1 = X * cyw + Zc * syw
+            let Z1 = -X * syw + Zc * cyw
+            let Y1 = Y * cpt - Z1 * spt
+            let Z2 = Y * spt + Z1 * cpt
+            let dp = pivotZ - Z2           // depth after rotation
+            guard dp > 1e-6, dp / zMax < 1 else { continue }
+            let up = f * X1 / dp + cx
+            let vp = cy - f * Y1 / dp
+            let px = Int(floor(up + 0.5)), py = Int(floor(vp + 0.5))
+            guard px >= 0, px < cw, py >= 0, py < ch else { continue }
+            let i = py * cw + px
+            if dp < zbuf[i] {
+                zbuf[i] = dp
+                depth[i] = dp
+                mask[i] = 1
+            }
+        }
+    }
+
+    for _ in 0..<max(0, params.fillRadius) {
+        var nd = depth, nm = mask
+        for y in 0..<ch {
+            for x in 0..<cw {
+                let i = y * cw + x
+                if mask[i] > 0.5 { continue }
+                var ds: Float = 0, n: Float = 0
+                for dy in -1...1 {
+                    for dx in -1...1 where !(dx == 0 && dy == 0) {
+                        let qx = min(max(x + dx, 0), cw - 1), qy = min(max(y + dy, 0), ch - 1)
+                        let j = qy * cw + qx
+                        if mask[j] > 0.5 { ds += depth[j]; n += 1 }
+                    }
+                }
+                if n > 0 { nd[i] = ds / n; nm[i] = 1 }
+            }
+        }
+        depth = nd; mask = nm
+    }
+    return (depth, mask)
+}
+
+/// Per-pixel comparison allowing the splat boundary to land ±1px off: a GPU pixel
+/// passes if its mask/depth match the CPU value at the same pixel or any 8-neighbor.
+/// Returns mismatch fraction and max same-pixel depth diff over co-valid pixels.
+func compareReproject(gpu: (depth: [Float], mask: [Float]),
+                      cpu: (depth: [Float], mask: [Float]),
+                      width w: Int, height h: Int, depthTol: Float)
+    -> (mismatchFraction: Double, maxDepthDiff: Double) {
+    var mismatches = 0
+    var maxDiff: Float = 0
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = y * w + x
+            let gv = gpu.mask[i] > 0.5
+            let cv = cpu.mask[i] > 0.5
+            var ok = cv == gv && (!gv || abs(gpu.depth[i] - cpu.depth[i]) <= depthTol)
+            if ok, gv { maxDiff = max(maxDiff, abs(gpu.depth[i] - cpu.depth[i])) }
+            if !ok {
+                // splat boundary allowance: a matching CPU pixel within ±1px
+                for dy in -1...1 {
+                    for dx in -1...1 where !(dx == 0 && dy == 0) {
+                        let qx = x + dx, qy = y + dy
+                        guard qx >= 0, qx < w, qy >= 0, qy < h else { continue }
+                        let j = qy * w + qx
+                        let cj = cpu.mask[j] > 0.5
+                        if cj == gv && (!gv || abs(gpu.depth[i] - cpu.depth[j]) <= depthTol) { ok = true }
+                    }
+                }
+            }
+            if !ok { mismatches += 1 }
+        }
+    }
+    return (Double(mismatches) / Double(w * h), Double(maxDiff))
+}
+
+func colorPatternRGBA(width w: Int, height h: Int) -> [UInt8] {
+    var out = [UInt8](repeating: 0, count: w * h * 4)
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = (y * w + x) * 4
+            out[i] = UInt8(x * 255 / max(w - 1, 1))
+            out[i + 1] = UInt8(y * 255 / max(h - 1, 1))
+            out[i + 2] = UInt8((x + y) % 256)
+            out[i + 3] = 255
+        }
+    }
+    return out
+}
+
 func pattern(width: Int, height: Int, seed: UInt64 = 42) -> [Float] {
     var rng = LCG(seed: seed)
     var out = [Float](repeating: 0, count: width * height)
@@ -305,6 +422,48 @@ do {
     let incremental = stack.canvas.readback()
     let full = try stack.render().readback()
     check("stack dirty vs full", "\(cw)x\(ch) 2 layers", incremental, full, tolerance: 0)
+
+    // M7 reproject: smooth ramp, canvas 2x depth res (nearest upsample), yaw 5, no fill
+    do {
+        let (sw, sh, rw, rh) = (48, 32, 96, 64)
+        var depth = [Float](repeating: 0, count: sw * sh)
+        for y in 0..<sh {
+            for x in 0..<sw { depth[y * sw + x] = 2 + Float(x) * 0.05 + sin(Float(y) * 0.2) }
+        }
+        let p = ReprojectParams(yawDeg: 5, fillRadius: 0, softenEdges: false)
+        let gpu = try ops.reproject(values: depth, width: sw, height: sh,
+                                    colorRGBA: colorPatternRGBA(width: rw, height: rh),
+                                    canvasWidth: rw, canvasHeight: rh, params: p)
+        let cpu = cpuReproject(depth: depth, width: sw, height: sh, canvas: rw, rh, params: p)
+        let r = compareReproject(gpu: (gpu.depth, gpu.mask), cpu: cpu,
+                                 width: rw, height: rh, depthTol: 1e-3)
+        // beyond the ±1px splat boundary, rasterization tie noise at silhouettes can
+        // leave a handful of unmatched pixels (15 of 6144 observed)
+        check("reproject yaw5 align", "\(sw)x\(sh)->\(rw)x\(rh)", [Float(r.mismatchFraction)], [0],
+              tolerance: 5e-3)
+        check("reproject yaw5 depth", "\(sw)x\(sh)->\(rw)x\(rh)", [Float(r.maxDepthDiff)], [0],
+              tolerance: 1e-3)
+    }
+
+    // M7 reproject: two depth planes (near left / far right), yaw -5 + pitch 2, fill 3
+    do {
+        let (sw, sh) = (64, 48)
+        var depth = [Float](repeating: 6, count: sw * sh)
+        for y in 0..<sh {
+            for x in 0..<(sw / 2) { depth[y * sw + x] = 2 }
+        }
+        let p = ReprojectParams(yawDeg: -5, pitchDeg: 2, fillRadius: 3, softenEdges: false)
+        let gpu = try ops.reproject(values: depth, width: sw, height: sh,
+                                    colorRGBA: colorPatternRGBA(width: sw, height: sh),
+                                    canvasWidth: sw, canvasHeight: sh, params: p)
+        let cpu = cpuReproject(depth: depth, width: sw, height: sh, canvas: sw, sh, params: p)
+        let r = compareReproject(gpu: (gpu.depth, gpu.mask), cpu: cpu,
+                                 width: sw, height: sh, depthTol: 2e-2)
+        check("reproject 2plane align", "\(sw)x\(sh) yaw-5 pitch2 fill3",
+              [Float(r.mismatchFraction)], [0], tolerance: 2e-2)
+        check("reproject 2plane depth", "\(sw)x\(sh) yaw-5 pitch2 fill3",
+              [Float(r.maxDepthDiff)], [0], tolerance: 2e-2)
+    }
 }
 
 let report = ParityReport(cases: cases, all_pass: cases.allSatisfy(\.pass))

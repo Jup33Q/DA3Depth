@@ -8,9 +8,11 @@ public final class GPUContext {
     let queue: MTLCommandQueue
 
     private var pipelines: [String: MTLComputePipelineState] = [:]
+    private var renderPipelines: [String: MTLRenderPipelineState] = [:]
+    private var depthStencils: [MTLCompareFunction: MTLDepthStencilState] = [:]
 
     /// GPU execution time of the most recent encode, in seconds.
-    public private(set) var lastGPUTime: Double = 0
+    public internal(set) var lastGPUTime: Double = 0
 
     public init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -31,6 +33,54 @@ public final class GPUContext {
         let pipeline = try device.makeComputePipelineState(function: function)
         pipelines[name] = pipeline
         return pipeline
+    }
+
+    /// Cached render pipeline for point-sprite splatting passes (color attachments +
+    /// a depth attachment that provides the hardware z-test — no atomics).
+    func renderPipeline(vertex vfName: String, fragment ffName: String,
+                        colorFormats: [MTLPixelFormat],
+                        depthFormat: MTLPixelFormat) throws -> MTLRenderPipelineState {
+        let key = "\(vfName)|\(ffName)|\(colorFormats.map(\.rawValue))|\(depthFormat.rawValue)"
+        if let cached = renderPipelines[key] { return cached }
+        guard let library = try? device.makeDefaultLibrary(bundle: .module) else {
+            throw DepthShaderError.libraryUnavailable
+        }
+        guard let vf = library.makeFunction(name: vfName),
+              let ff = library.makeFunction(name: ffName) else {
+            throw DepthShaderError.kernelNotFound("\(vfName)/\(ffName)")
+        }
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vf
+        descriptor.fragmentFunction = ff
+        for (i, format) in colorFormats.enumerated() {
+            descriptor.colorAttachments[i].pixelFormat = format
+        }
+        descriptor.depthAttachmentPixelFormat = depthFormat
+        let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        renderPipelines[key] = pipeline
+        return pipeline
+    }
+
+    func depthStencil(compare: MTLCompareFunction) -> MTLDepthStencilState {
+        if let cached = depthStencils[compare] { return cached }
+        let descriptor = MTLDepthStencilDescriptor()
+        descriptor.depthCompareFunction = compare
+        descriptor.isDepthWriteEnabled = true
+        let state = device.makeDepthStencilState(descriptor: descriptor)!
+        depthStencils[compare] = state
+        return state
+    }
+
+    /// Wraps a full command-buffer encode (render + optional compute passes) with
+    /// one commit+wait, mirroring `encodeBatch` for non-compute work.
+    func encodeFrame(_ body: (MTLCommandBuffer) throws -> Void) throws {
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw DepthShaderError.encodingFailed
+        }
+        try body(commandBuffer)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        lastGPUTime = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
     }
 
     /// One compute dispatch inside a batched command buffer.
@@ -66,8 +116,7 @@ public final class GPUContext {
     }
 
     func encode<T>(_ pipeline: MTLComputePipelineState, width: Int, height: Int,
-                   _ body: (MTLComputeCommandEncoder) -> T) throws -> T {
-        guard let commandBuffer = queue.makeCommandBuffer(),
+                   _ body: (MTLComputeCommandEncoder) -> T) throws -> T {        guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw DepthShaderError.encodingFailed
         }
